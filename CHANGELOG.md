@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Exa.ai search provider.** Neural/semantic search available alongside Perplexity and Gemini. 1,000 free requests/month. Set `EXA_API_KEY` env var or `exaApiKey` in `~/.pi/web-search.json`, or select explicitly with `provider: "exa"`. Includes built-in content extraction — when `includeContent` is true, full page text comes back with search results instead of requiring a separate background fetch. Monthly usage tracked in `~/.pi/exa-usage.json` with a warning at 80%.
+- **Exa MCP fallback.** When no Exa API key is configured, search routes through `mcp.exa.ai` with zero setup. Supports basic search and `includeContent` but not domain/recency filtering (falls through to Gemini for those).
+- **`code_search` tool.** Code/documentation search via Exa MCP (`get_code_context_exa`). No API key required. Returns code examples, docs, and API references from GitHub, Stack Overflow, and official documentation.
+
 ## [0.10.3] - 2026-03-12
 
 ### Added

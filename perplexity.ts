@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { activityMonitor } from "./activity.js";
+import type { ExtractedContent } from "./extract.js";
 
 const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
@@ -22,6 +23,7 @@ export interface SearchResult {
 export interface SearchResponse {
 	answer: string;
 	results: SearchResult[];
+	inlineContent?: ExtractedContent[];
 }
 
 export interface SearchOptions {

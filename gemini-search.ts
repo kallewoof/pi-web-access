@@ -5,8 +5,9 @@ import { activityMonitor } from "./activity.js";
 import { getApiKey, API_BASE, DEFAULT_MODEL } from "./gemini-api.js";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.js";
 import { isPerplexityAvailable, searchWithPerplexity, type SearchResult, type SearchResponse, type SearchOptions } from "./perplexity.js";
+import { hasExaApiKey, isExaAvailable, searchWithExa } from "./exa.js";
 
-export type SearchProvider = "auto" | "perplexity" | "gemini";
+export type SearchProvider = "auto" | "perplexity" | "gemini" | "exa";
 
 const CONFIG_PATH = join(homedir(), ".pi", "web-search.json");
 
@@ -37,6 +38,7 @@ function normalizeSearchModel(value: unknown): string | undefined {
 
 export interface FullSearchOptions extends SearchOptions {
 	provider?: SearchProvider;
+	includeContent?: boolean;
 }
 
 export async function search(query: string, options: FullSearchOptions = {}): Promise<SearchResponse> {
@@ -58,6 +60,37 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 		);
 	}
 
+	if (provider === "exa") {
+		const exaApiKeyConfigured = hasExaApiKey();
+		try {
+			const result = await searchWithExa(query, options);
+			if (result && "exhausted" in result) {
+				throw new Error(
+					"Exa monthly free tier exhausted (1,000 requests). Resets next month.\n" +
+					"  Use provider: 'perplexity' or 'gemini', or upgrade at exa.ai/pricing"
+				);
+			}
+			if (result && "answer" in result) return result;
+		} catch (err) {
+			if (exaApiKeyConfigured) throw err;
+			const message = err instanceof Error ? err.message : String(err);
+			if (message.toLowerCase().includes("abort")) throw err;
+		}
+		if (exaApiKeyConfigured) {
+			throw new Error("Exa search unavailable. Check EXA_API_KEY or exaApiKey in ~/.pi/web-search.json");
+		}
+	}
+
+	if (provider !== "exa" && isExaAvailable()) {
+		try {
+			const result = await searchWithExa(query, options);
+			if (result && "answer" in result) return result;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (message.toLowerCase().includes("abort")) throw err;
+		}
+	}
+
 	if (isPerplexityAvailable()) {
 		return searchWithPerplexity(query, options);
 	}
@@ -69,8 +102,9 @@ export async function search(query: string, options: FullSearchOptions = {}): Pr
 	throw new Error(
 		"No search provider available. Either:\n" +
 		"  1. Set perplexityApiKey in ~/.pi/web-search.json\n" +
-		"  2. Set GEMINI_API_KEY in ~/.pi/web-search.json\n" +
-		"  3. Sign into gemini.google.com in a supported Chromium-based browser"
+		"  2. Set EXA_API_KEY (or exaApiKey) in ~/.pi/web-search.json\n" +
+		"  3. Set GEMINI_API_KEY in ~/.pi/web-search.json\n" +
+		"  4. Sign into gemini.google.com in a supported Chromium-based browser"
 	);
 }
 

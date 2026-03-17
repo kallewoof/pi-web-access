@@ -5,6 +5,7 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import { fetchAllContent, type ExtractedContent } from "./extract.js";
 import { clearCloneCache } from "./github-extract.js";
 import { search, type SearchProvider } from "./gemini-search.js";
+import { executeCodeSearch } from "./code-search.js";
 import type { SearchResult } from "./perplexity.js";
 import { formatSeconds } from "./utils.js";
 import {
@@ -25,6 +26,7 @@ import { platform, homedir } from "node:os";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isPerplexityAvailable } from "./perplexity.js";
+import { isExaAvailable } from "./exa.js";
 import { isGeminiApiAvailable } from "./gemini-api.js";
 import { getActiveGoogleEmail, isGeminiWebAvailable } from "./gemini-web.js";
 import {
@@ -81,18 +83,25 @@ function formatShortcut(key: string): string {
 
 function resolveProvider(
 	requested: string | undefined,
-	available: { perplexity: boolean; gemini: boolean },
+	available: { perplexity: boolean; exa: boolean; gemini: boolean },
 ): string {
 	const provider = requested || loadConfig().provider || "auto";
 	if (provider === "auto" || provider === "") {
+		if (available.exa) return "exa";
 		if (available.perplexity) return "perplexity";
 		if (available.gemini) return "gemini";
-		return "perplexity";
+		return "exa";
+	}
+	if (provider === "exa" && !available.exa) {
+		if (available.perplexity) return "perplexity";
+		return available.gemini ? "gemini" : "exa";
 	}
 	if (provider === "perplexity" && !available.perplexity) {
+		if (available.exa) return "exa";
 		return available.gemini ? "gemini" : "perplexity";
 	}
 	if (provider === "gemini" && !available.gemini) {
+		if (available.exa) return "exa";
 		return available.perplexity ? "perplexity" : "gemini";
 	}
 	return provider;
@@ -108,12 +117,13 @@ interface PendingCurate {
 	phase: "searching" | "curate-window" | "curating" | "condensing";
 	searchResults: Map<number, QueryResultData>;
 	allUrls: string[];
+	allInlineContent: ExtractedContent[];
 	queryList: string[];
 	includeContent: boolean;
 	numResults?: number;
 	recencyFilter?: "day" | "week" | "month" | "year";
 	domainFilter?: string[];
-	availableProviders: { perplexity: boolean; gemini: boolean };
+	availableProviders: { perplexity: boolean; exa: boolean; gemini: boolean };
 	defaultProvider: string;
 	onUpdate: ((update: { content: Array<{ type: string; text: string }>; details?: Record<string, unknown> }) => void) | undefined;
 	signal: AbortSignal | undefined;
@@ -141,6 +151,12 @@ function formatSearchSummary(results: SearchResult[], answer: string): string {
 	let output = answer ? `${answer}\n\n---\n\n**Sources:**\n` : "";
 	output += results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}`).join("\n\n");
 	return output;
+}
+
+function hasFullInlineCoverage(urls: string[], inlineContent: ExtractedContent[] | undefined): boolean {
+	if (!inlineContent || inlineContent.length === 0) return false;
+	const coveredUrls = new Set(inlineContent.map(c => c.url));
+	return urls.every(url => coveredUrls.has(url));
 }
 
 function formatFullResults(queryData: QueryResultData): string {
@@ -330,6 +346,7 @@ export default function (pi: ExtensionAPI) {
 		results: QueryResultData[];
 		urls: string[];
 		includeContent: boolean;
+		inlineContent?: ExtractedContent[];
 		curated?: boolean;
 		curatedFrom?: number;
 	}
@@ -349,10 +366,26 @@ export default function (pi: ExtensionAPI) {
 			else output += formatSearchSummary(results, answer) + "\n\n";
 		}
 
-		const fetchId = opts.includeContent ? startBackgroundFetch(opts.urls) : null;
-		if (fetchId) output += `---\nContent fetching in background [${fetchId}]. Will notify when ready.`;
+		const hasInlineReady = hasFullInlineCoverage(opts.urls, opts.inlineContent);
+		let fetchId: string | null = null;
+		if (hasInlineReady && opts.inlineContent) {
+			fetchId = generateId();
+			const data: StoredSearchData = {
+				id: fetchId,
+				type: "fetch",
+				timestamp: Date.now(),
+				urls: opts.inlineContent,
+			};
+			storeResult(fetchId, data);
+			pi.appendEntry("web-search-results", data);
+			output += `---\nFull content for ${opts.inlineContent.length} sources available [${fetchId}].`;
+		} else if (opts.includeContent) {
+			fetchId = startBackgroundFetch(opts.urls);
+			if (fetchId) output += `---\nContent fetching in background [${fetchId}]. Will notify when ready.`;
+		}
 
 		const searchId = storeAndPublishSearch(opts.results);
+		const isBackgroundFetch = fetchId !== null && !hasInlineReady;
 
 		return {
 			content: [{ type: "text", text: output.trim() }],
@@ -363,7 +396,7 @@ export default function (pi: ExtensionAPI) {
 				totalResults: tr,
 				includeContent: opts.includeContent,
 				fetchId,
-				fetchUrls: fetchId ? opts.urls : undefined,
+				fetchUrls: isBackgroundFetch ? opts.urls : undefined,
 				searchId,
 				...(opts.curated ? {
 					curated: true,
@@ -384,6 +417,7 @@ export default function (pi: ExtensionAPI) {
 		results: QueryResultData[];
 		urls: string[];
 		includeContent: boolean;
+		inlineContent?: ExtractedContent[];
 	}) {
 		const sc = opts.results.filter(r => !r.error).length;
 		const tr = opts.results.reduce((sum, r) => sum + r.results.length, 0);
@@ -395,8 +429,24 @@ export default function (pi: ExtensionAPI) {
 		output += " (retrieve by query text or index).]\n\n";
 		output += opts.condensed;
 
-		const fetchId = opts.includeContent ? startBackgroundFetch(opts.urls) : null;
-		if (fetchId) output += `\n\n---\nContent fetching in background [${fetchId}]. Will notify when ready.`;
+		const hasInlineReady = hasFullInlineCoverage(opts.urls, opts.inlineContent);
+		let fetchId: string | null = null;
+		if (hasInlineReady && opts.inlineContent) {
+			fetchId = generateId();
+			const data: StoredSearchData = {
+				id: fetchId,
+				type: "fetch",
+				timestamp: Date.now(),
+				urls: opts.inlineContent,
+			};
+			storeResult(fetchId, data);
+			pi.appendEntry("web-search-results", data);
+			output += `\n\n---\nFull content for ${opts.inlineContent.length} sources available [${fetchId}].`;
+		} else if (opts.includeContent) {
+			fetchId = startBackgroundFetch(opts.urls);
+			if (fetchId) output += `\n\n---\nContent fetching in background [${fetchId}]. Will notify when ready.`;
+		}
+		const isBackgroundFetch = fetchId !== null && !hasInlineReady;
 
 		return {
 			content: [{ type: "text", text: output.trim() }],
@@ -407,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 				totalResults: tr,
 				includeContent: opts.includeContent,
 				fetchId,
-				fetchUrls: fetchId ? opts.urls : undefined,
+				fetchUrls: isBackgroundFetch ? opts.urls : undefined,
 				searchId,
 				condensed: true,
 				condensedFrom: queryList.length,
@@ -454,11 +504,13 @@ export default function (pi: ExtensionAPI) {
 					onSubmit(selectedQueryIndices) {
 						searchAbort.abort();
 						const filtered = filterByQueryIndices(selectedQueryIndices, pc.searchResults);
+						const filteredInline = pc.allInlineContent.filter(c => filtered.urls.includes(c.url));
 						pc.finish(buildSearchReturn({
 							queryList: filtered.results.map(r => r.query),
 							results: filtered.results,
 							urls: filtered.urls,
 							includeContent: pc.includeContent,
+							inlineContent: filteredInline.length > 0 ? filteredInline : undefined,
 							curated: true,
 							curatedFrom: pc.searchResults.size,
 						}));
@@ -473,17 +525,19 @@ export default function (pi: ExtensionAPI) {
 						saveConfig({ provider });
 					},
 					async onAddSearch(query, queryIndex) {
-						const { answer, results } = await search(query, {
+						const { answer, results, inlineContent } = await search(query, {
 							provider: pc.defaultProvider as SearchProvider | undefined,
 							numResults: pc.numResults,
 							recencyFilter: pc.recencyFilter,
 							domainFilter: pc.domainFilter,
+							includeContent: pc.includeContent,
 							signal: addSearchSignal,
 						});
 						pc.searchResults.set(queryIndex, { query, answer, results, error: null });
 						for (const r of results) {
 							if (!pc.allUrls.includes(r.url)) pc.allUrls.push(r.url);
 						}
+						if (inlineContent) pc.allInlineContent.push(...inlineContent);
 						return {
 							answer,
 							results: results.map(r => ({ title: r.title, url: r.url, domain: extractDomain(r.url) })),
@@ -577,7 +631,7 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			`Search the web using Perplexity AI or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Multi-query searches include a brief review window where the user can press ${curateLabel} to curate results in the browser before they're sent. Set curate to false to skip this. Provider auto-selects: Perplexity if configured, else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).`,
+			`Search the web using Perplexity AI, Exa, or Gemini. Returns an AI-synthesized answer with source citations. For comprehensive research, prefer queries (plural) with 2-4 varied angles over a single query — each query gets its own synthesized answer, so varying phrasing and scope gives much broader coverage. When includeContent is true, full page content is fetched in the background. Multi-query searches include a brief review window where the user can press ${curateLabel} to curate results in the browser before they're sent. Set curate to false to skip this. Provider auto-selects: Exa (direct API with key, MCP fallback without), else Perplexity (needs key), else Gemini API (needs key), else Gemini Web (needs a supported Chromium-based browser login).`,
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead." })),
 			queries: Type.Optional(Type.Array(Type.String(), { description: "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results)." })),
@@ -588,7 +642,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
 			provider: Type.Optional(
-				StringEnum(["auto", "perplexity", "gemini"], { description: "Search provider (default: auto)" }),
+				StringEnum(["auto", "perplexity", "gemini", "exa"], { description: "Search provider (default: auto)" }),
 			),
 			curate: Type.Optional(Type.Boolean({
 				description: `Hold results for review after searching. The user can press ${curateLabel} to open an interactive review page in the browser, or wait for the countdown to auto-send all results. Enabled by default for multi-query searches. Set to false to skip the review window.`,
@@ -617,13 +671,16 @@ export default function (pi: ExtensionAPI) {
 				const includeContent = params.includeContent ?? false;
 				const searchResults = new Map<number, QueryResultData>();
 				const allUrls: string[] = [];
+				const allInlineContent: ExtractedContent[] = [];
 				let cancelled = false;
 
 				const pplxAvail = isPerplexityAvailable();
+				const exaAvail = isExaAvailable();
 				const geminiApiAvail = isGeminiApiAvailable();
 				const geminiWebAvail = await isGeminiWebAvailable();
 				const availableProviders = {
 					perplexity: pplxAvail,
+					exa: exaAvail,
 					gemini: geminiApiAvail || !!geminiWebAvail,
 				};
 				const defaultProvider = resolveProvider(params.provider, availableProviders);
@@ -634,6 +691,7 @@ export default function (pi: ExtensionAPI) {
 					phase: "searching",
 					searchResults,
 					allUrls,
+					allInlineContent,
 					queryList,
 					includeContent,
 					numResults: params.numResults,
@@ -664,6 +722,7 @@ export default function (pi: ExtensionAPI) {
 						results,
 						urls: allUrls,
 						includeContent,
+						inlineContent: allInlineContent.length > 0 ? allInlineContent : undefined,
 					}));
 				};
 
@@ -681,17 +740,19 @@ export default function (pi: ExtensionAPI) {
 						details: { phase: "searching", progress: qi / queryList.length, currentQuery: queryList[qi] },
 					});
 					try {
-						const { answer, results } = await search(queryList[qi], {
+						const { answer, results, inlineContent } = await search(queryList[qi], {
 							provider: defaultProvider as SearchProvider | undefined,
 							numResults: params.numResults,
 							recencyFilter: params.recencyFilter,
 							domainFilter: params.domainFilter,
+							includeContent: params.includeContent,
 							signal,
 						});
 						searchResults.set(qi, { query: queryList[qi], answer, results, error: null });
 						for (const r of results) {
 							if (!allUrls.includes(r.url)) allUrls.push(r.url);
 						}
+						if (inlineContent) allInlineContent.push(...inlineContent);
 						if (activeCurator) {
 							activeCurator.pushResult(qi, {
 								answer,
@@ -796,6 +857,7 @@ export default function (pi: ExtensionAPI) {
 								results: [...searchResults.values()],
 								urls: allUrls,
 								includeContent,
+								inlineContent: allInlineContent.length > 0 ? allInlineContent : undefined,
 							}));
 						} else {
 							cancel();
@@ -810,6 +872,7 @@ export default function (pi: ExtensionAPI) {
 
 			const searchResults: QueryResultData[] = [];
 			const allUrls: string[] = [];
+			const allInlineContent: ExtractedContent[] = [];
 			const resolvedProvider = params.provider || loadConfig().provider || undefined;
 
 			for (let i = 0; i < queryList.length; i++) {
@@ -821,11 +884,12 @@ export default function (pi: ExtensionAPI) {
 				});
 
 				try {
-					const { answer, results } = await search(query, {
+					const { answer, results, inlineContent } = await search(query, {
 						provider: resolvedProvider as SearchProvider | undefined,
 						numResults: params.numResults,
 						recencyFilter: params.recencyFilter,
 						domainFilter: params.domainFilter,
+						includeContent: params.includeContent,
 						signal,
 					});
 
@@ -835,6 +899,7 @@ export default function (pi: ExtensionAPI) {
 							allUrls.push(r.url);
 						}
 					}
+					if (inlineContent) allInlineContent.push(...inlineContent);
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
 					searchResults.push({ query, answer: "", results: [], error: message });
@@ -846,6 +911,7 @@ export default function (pi: ExtensionAPI) {
 				results: searchResults,
 				urls: allUrls,
 				includeContent: params.includeContent ?? false,
+				inlineContent: allInlineContent.length > 0 ? allInlineContent : undefined,
 			});
 		},
 
@@ -957,7 +1023,7 @@ export default function (pi: ExtensionAPI) {
 			if (details?.fetchId && details?.fetchUrls) {
 				statusLine += theme.fg("muted", ` (fetching ${details.fetchUrls.length} URLs)`);
 			} else if (details?.fetchId) {
-				statusLine += theme.fg("muted", " (content fetching)");
+				statusLine += theme.fg("muted", " (content ready)");
 			}
 
 			if (!expanded) {
@@ -1032,6 +1098,47 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return new Text(lines.join("\n"), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "code_search",
+		label: "Code Search",
+		description: "Search for code examples, documentation, and API references. Returns relevant code snippets and docs from GitHub, Stack Overflow, and official documentation. Use for any programming question — API usage, library examples, debugging help.",
+		parameters: Type.Object({
+			query: Type.String({ description: "Programming question, API, library, or debugging topic to search for" }),
+			maxTokens: Type.Optional(Type.Integer({
+				minimum: 1000,
+				maximum: 50000,
+				description: "Maximum tokens of code/documentation context to return (default: 5000)",
+			})),
+		}),
+
+		async execute(toolCallId, params, signal) {
+			return executeCodeSearch(toolCallId, params, signal);
+		},
+
+		renderCall(args, theme) {
+			const { query } = args as { query?: string };
+			const display = !query
+				? "(no query)"
+				: query.length > 70 ? query.slice(0, 67) + "..." : query;
+			return new Text(theme.fg("toolTitle", theme.bold("code_search ")) + theme.fg("accent", display), 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as { query?: string; maxTokens?: number; error?: string };
+			if (details?.error) {
+				return new Text(theme.fg("error", `Error: ${details.error}`), 0, 0);
+			}
+
+			const summary = theme.fg("success", "code context returned") +
+				theme.fg("muted", ` (${details?.maxTokens ?? 5000} tokens max)`);
+			if (!expanded) return new Text(summary, 0, 0);
+
+			const textContent = result.content.find((c) => c.type === "text")?.text || "";
+			const preview = textContent.length > 500 ? textContent.slice(0, 500) + "..." : textContent;
+			return new Text(summary + "\n" + theme.fg("dim", preview), 0, 0);
 		},
 	});
 
@@ -1442,10 +1549,12 @@ export default function (pi: ExtensionAPI) {
 			const queries = args.trim() ? args.trim().split(/\s*,\s*/) : [];
 
 			const pplxAvail = isPerplexityAvailable();
+			const exaAvail = isExaAvailable();
 			const geminiApiAvail = isGeminiApiAvailable();
 			const geminiWebAvail = await isGeminiWebAvailable();
 			const availableProviders = {
 				perplexity: pplxAvail,
+				exa: exaAvail,
 				gemini: geminiApiAvail || !!geminiWebAvail,
 			};
 			const defaultProvider = resolveProvider(undefined, availableProviders);
