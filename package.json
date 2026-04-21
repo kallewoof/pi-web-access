@@ -30,6 +30,9 @@
     "turndown": "^7.2.0",
     "unpdf": "^1.4.0"
   },
+  "scripts": {
+    "test": "node --import tsx/esm --test 'tests/**/*.test.ts'"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
@@ -38,5 +41,8 @@
       "./skills"
     ],
     "video": "https://github.com/nicobailon/pi-web-access/raw/refs/heads/main/pi-web-fetch-demo.mp4"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
   }
 }

@@ -467,6 +467,25 @@ function isLikelyJSRendered(html: string): boolean {
 	return textContent.length < 500 && scriptCount > 3;
 }
 
+function detectCharset(contentTypeHeader: string, buffer: ArrayBuffer): string {
+	const headerMatch = /charset=([\w-]+)/i.exec(contentTypeHeader);
+	if (headerMatch) return headerMatch[1];
+	// Scan the first 4 KB decoded as Latin-1 (every byte is a valid code point,
+	// and ASCII tags are identical in all ASCII-compatible encodings) to find a
+	// <meta charset> or <meta http-equiv="Content-Type" content="...charset=..."> declaration.
+	const preview = new TextDecoder("latin1").decode(buffer.slice(0, 4096));
+	const metaMatch = /charset=["']?([\w-]+)/i.exec(preview);
+	return metaMatch ? metaMatch[1] : "utf-8";
+}
+
+function decodeResponseBuffer(buffer: ArrayBuffer, charset: string): string {
+	try {
+		return new TextDecoder(charset).decode(buffer);
+	} catch {
+		return new TextDecoder("utf-8", { fatal: false }).decode(buffer);
+	}
+}
+
 async function extractViaHttp(
 	url: string,
 	signal?: AbortSignal,
@@ -556,7 +575,9 @@ async function extractViaHttp(
 			};
 		}
 
-		const text = await response.text();
+		const buffer = await response.arrayBuffer();
+		const charset = detectCharset(contentType, buffer);
+		const text = decodeResponseBuffer(buffer, charset);
 		const isHTML = contentType.includes("text/html") || contentType.includes("application/xhtml+xml");
 
 		if (!isHTML) {
